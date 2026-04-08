@@ -183,14 +183,49 @@ A Confluence page exists in the SAN space as the architecture reference:
 
 ---
 
-## Jira Automation Rule (WIP)
+## Jira Automation Rule (Ticket-based)
 
-A parallel implementation as a Jira automation rule (no agent interaction) is in progress.
-- Trigger: Version released
-- Steps: Fetch issues → Find architecture page → Create SNOW CR
-- Default values hardcoded for demo (project=SAN, assignment_group=App Engine Admins)
-- JSON file: `snowtools-automation-rule.json` (not committed — in .gitignore)
-- Status: Import format issues being resolved
+A separate implementation as a Jira automation rule for individual ticket deployments.
+Unlike the agent flow (release-based, conversational), this is fully automated with zero user interaction.
+
+### Flow
+```
+Trigger: Issue transitions to "READY FOR DEPLOYMENT"
+  │
+  ├─ Step 1: Invoke Rovo agent (Studio agent, automation scenario)
+  │    Message: "AUTOMATION RULE {{issue.key}}"
+  │    Agent reads the ticket, extracts deployment details from description,
+  │    returns a single JSON object with all SNOW CR fields
+  │
+  ├─ Step 2: Send web request → POST to SNOW API
+  │    Body: {{agentResponse}}  (the full JSON from the agent, passed directly)
+  │    Headers: Content-Type, Accept, Authorization (Basic Auth)
+  │
+  └─ Step 3: Add comment to Jira ticket
+       "✅ SNOW CR created: {{webResponse.body.result.number}}"
+```
+
+### Key Design Decisions
+- **Agent returns raw JSON** — no code fences, no markdown, no explanations. Just valid JSON.
+  This allows `{{agentResponse}}` to be passed directly as the web request body.
+- **Prompt handles value mapping** — risk/impact labels are converted to SNOW numeric values
+  in the prompt (e.g. "Moderate" → `"3"`), not in a handler function.
+- **Deployment details in ticket description** — the ticket must contain a "Deployment Details"
+  section with: Environment, Affected Components, Deployment Window, Assignment Group,
+  Rollback Plan, Risk Level.
+- **Studio agent with scenario** — the prompt is in `prompts/automation-scenario.md`, copied
+  to a separate scenario in the Studio agent. The Forge agent code is not modified.
+- **`{{agentResponse}}`** is a single string, not a parsed JSON object — dot notation
+  (e.g. `{{agentResponse.short_description}}`) does NOT work in Jira automation.
+
+### Files
+- `prompts/automation-scenario.md` — the prompt for the automation scenario
+- `snowtools-automation-rule.json` — draft automation rule JSON (not committed, in .gitignore)
+
+### Test Ticket
+- SAN-8: https://sk-demo-site.atlassian.net/browse/SAN-8
+- Contains deployment details section with all needed fields
+- Workflow has "READY FOR DEPLOYMENT" status configured
 
 ---
 
