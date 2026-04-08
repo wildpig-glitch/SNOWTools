@@ -1,3 +1,5 @@
 node_modules/
 .atlassian/
 *.local
+automation-rule-*.json
+snowtools-automation-rule.json
