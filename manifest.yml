@@ -9,6 +9,7 @@ modules:
       actions:
         - get-jira-release
         - create-snow-change-request
+        - convert-snow-csv-to-jira
   action:
     - key: get-jira-release
       name: Get Jira Release
@@ -113,11 +114,40 @@ modules:
             Each section is separated by a newline and the next section label.
             Generate this from the release issues and architecture reference page.
             Do not ask the user for this.
+    - key: convert-snow-csv-to-jira
+      name: Convert SNOW CSV to Jira Import
+      function: convertSnowCsvToJira
+      actionVerb: GET
+      description: |
+        Converts a ServiceNow CSV export file (attached to a Confluence page) into a
+        Jira-ready CSV import file, and uploads the result back as a new attachment on
+        the same Confluence page. Call this when the user wants to transform a SNOW export
+        into a format that can be imported into Jira.
+      inputs:
+        page_url:
+          title: Confluence Page URL
+          type: string
+          required: true
+          description: |
+            The full URL of the Confluence page where the SNOW CSV export file is attached,
+            or a bare numeric Confluence page ID.
+            Example: "https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Page+Title"
+            Ask the user to provide this value.
+        attachment_filename:
+          title: Attachment Filename Hint
+          type: string
+          required: false
+          description: |
+            Optional partial filename to identify the correct CSV attachment if the page
+            has multiple attachments. For example "snow" or "export". Leave blank to
+            automatically pick the first .csv file found on the page.
   function:
     - key: getJiraRelease
       handler: index.getJiraRelease
     - key: createSnowChangeRequest
       handler: index.createSnowChangeRequest
+    - key: convertSnowCsvToJira
+      handler: index.convertSnowCsvToJira
 app:
   runtime:
     name: nodejs24.x
@@ -135,3 +165,5 @@ permissions:
   scopes:
     - read:jira-work
     - read:chat:rovo
+    - read:confluence-content.all
+    - write:confluence-content

@@ -244,6 +244,673 @@ function mapImpact(impact) {
  * @param {string} payload.end_date - Planned end datetime (YYYY-MM-DD HH:MM:SS).
  * @returns {object} Result object with success status, CR details or error information.
  */
+/**
+ * Converts a ServiceNow CSV export (attached to a Confluence page) into a
+ * Jira-ready CSV import file, and uploads the result back as a new attachment
+ * on the same Confluence page.
+ *
+ * ## What this function does
+ *
+ * 1. Extracts the Confluence page ID from the provided URL (or uses it directly
+ *    if the caller already passed a numeric ID).
+ * 2. Fetches the list of attachments on that page via the Confluence REST API.
+ * 3. Finds the target CSV file (optionally filtered by filename hint).
+ * 4. Downloads the raw CSV content.
+ * 5. Parses the CSV properly (handles quoted fields containing commas and newlines).
+ * 6. Transforms each SNOW row into a Jira-compatible row:
+ *    - Summary:   "{SNOW number} - {short_description}"
+ *    - Work Type: Incident / Change Request / Service Request
+ *    - Priority:  mapped from SNOW format ("3 - Moderate") to Jira ("Medium")
+ *    - Labels:    lowercase ticket type ("incident", "change_request", "service_request")
+ *    - Description: plain-text block with all SNOW metadata + description + resolution
+ *    - Comments:  split from comments_and_work_notes using a datetime regex;
+ *                 the number of Comment columns is auto-detected from the data.
+ * 7. Serialises the result as a properly-quoted CSV string.
+ * 8. Uploads the output CSV as an attachment named "jira_import.csv" to the same
+ *    Confluence page (replaces the file if it already exists).
+ * 9. Returns a summary object for the agent to relay to the user.
+ *
+ * @param {object} payload - The action input payload provided by the Rovo agent.
+ * @param {string} payload.page_url - The full Confluence page URL or a numeric page ID.
+ * @param {string} [payload.attachment_filename] - Optional filename hint. If the page has
+ *   multiple CSV attachments, this narrows the search. Partial match is fine (e.g. "snow").
+ * @returns {object} Result object with success flag, ticket count, max comments, and
+ *   the URL of the uploaded jira_import.csv attachment.
+ */
+export async function convertSnowCsvToJira(payload) {
+
+  // ---------------------------------------------------------------------------
+  // STEP 1 — Validate inputs
+  // ---------------------------------------------------------------------------
+
+  const rawPageUrl = (payload.page_url || '').trim();
+  if (!rawPageUrl) {
+    return {
+      success: false,
+      error: 'page_url is required. Please provide the full Confluence page URL or a numeric page ID.'
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 2 — Extract the page ID from the URL
+  //
+  // Confluence page URLs come in two formats:
+  //   Modern:  https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Page+Title
+  //   Legacy:  https://site.atlassian.net/wiki/display/KEY/Page+Title?pageId=123456789
+  //
+  // We also accept a bare numeric page ID string (e.g. "123456789").
+  // ---------------------------------------------------------------------------
+
+  let pageId;
+
+  // Try to extract numeric page ID from a "/pages/{id}/" segment in the URL.
+  const pagesMatch = rawPageUrl.match(/\/pages\/(\d+)/);
+  if (pagesMatch) {
+    pageId = pagesMatch[1];
+  } else {
+    // Try query-string format: ?pageId=123456789
+    const queryMatch = rawPageUrl.match(/[?&]pageId=(\d+)/);
+    if (queryMatch) {
+      pageId = queryMatch[1];
+    } else if (/^\d+$/.test(rawPageUrl)) {
+      // The caller passed a bare numeric ID.
+      pageId = rawPageUrl;
+    }
+  }
+
+  if (!pageId) {
+    return {
+      success: false,
+      error: `Could not extract a page ID from: "${rawPageUrl}". ` +
+        `Please provide a full Confluence page URL (e.g. https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Title) ` +
+        `or a numeric page ID.`
+    };
+  }
+
+  console.log(`convertSnowCsvToJira: using page ID ${pageId}`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 3 — Fetch the list of attachments on the Confluence page
+  // ---------------------------------------------------------------------------
+
+  let attachmentsResponse;
+  try {
+    attachmentsResponse = await api.asUser().requestConfluence(
+      route`/wiki/rest/api/content/${pageId}/child/attachment?expand=metadata&limit=50`
+    );
+  } catch (err) {
+    console.error(`Error fetching attachments: ${err.message}`);
+    return {
+      success: false,
+      error: `Could not fetch attachments for page ${pageId}: ${err.message}`
+    };
+  }
+
+  if (!attachmentsResponse.ok) {
+    const errText = await attachmentsResponse.text();
+    console.error(`Confluence attachments API error ${attachmentsResponse.status}: ${errText}`);
+    if (attachmentsResponse.status === 404) {
+      return {
+        success: false,
+        error: `Confluence page with ID "${pageId}" was not found. ` +
+          `Please check the URL and make sure the page exists and you have access to it.`
+      };
+    }
+    return {
+      success: false,
+      error: `Confluence API returned HTTP ${attachmentsResponse.status} when fetching attachments. Detail: ${errText}`
+    };
+  }
+
+  const attachmentsData = await attachmentsResponse.json();
+  const attachments = attachmentsData.results || [];
+
+  if (attachments.length === 0) {
+    return {
+      success: false,
+      error: `No attachments found on Confluence page ${pageId}. ` +
+        `Please upload the SNOW CSV export file to that page first.`
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 4 — Find the target CSV attachment
+  //
+  // Selection priority:
+  //  1. If attachment_filename is provided, find an attachment whose filename
+  //     contains that string (case-insensitive).
+  //  2. Otherwise, pick the first attachment with a .csv extension.
+  // ---------------------------------------------------------------------------
+
+  const filenameHint = (payload.attachment_filename || '').trim().toLowerCase();
+
+  let targetAttachment;
+  if (filenameHint) {
+    targetAttachment = attachments.find(a =>
+      (a.title || '').toLowerCase().includes(filenameHint)
+    );
+    if (!targetAttachment) {
+      const allNames = attachments.map(a => a.title).join(', ');
+      return {
+        success: false,
+        error: `No attachment matching "${filenameHint}" found on page ${pageId}. ` +
+          `Available attachments: ${allNames}. ` +
+          `Please check the filename hint or leave it blank to pick the first CSV found.`
+      };
+    }
+  } else {
+    // No hint — pick the first .csv file.
+    targetAttachment = attachments.find(a =>
+      (a.title || '').toLowerCase().endsWith('.csv')
+    );
+    if (!targetAttachment) {
+      const allNames = attachments.map(a => a.title).join(', ');
+      return {
+        success: false,
+        error: `No CSV attachment found on page ${pageId}. ` +
+          `Available attachments: ${allNames}. ` +
+          `Please upload your SNOW export as a .csv file.`
+      };
+    }
+  }
+
+  console.log(`Found attachment: "${targetAttachment.title}" (id: ${targetAttachment.id})`);
+
+  // Build the download URL from the attachment's _links.download path.
+  // The download link is a relative path like /wiki/download/attachments/...
+  const downloadPath = targetAttachment._links && targetAttachment._links.download;
+  if (!downloadPath) {
+    return {
+      success: false,
+      error: `Could not determine the download URL for attachment "${targetAttachment.title}".`
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 5 — Download the CSV attachment content
+  // ---------------------------------------------------------------------------
+
+  let csvText;
+  try {
+    const downloadResponse = await api.asUser().requestConfluence(
+      // requestConfluence accepts a full path; route`` handles encoding.
+      // The download path already includes /wiki/ prefix so we pass it directly.
+      route`${downloadPath}`
+    );
+    if (!downloadResponse.ok) {
+      const errText = await downloadResponse.text();
+      return {
+        success: false,
+        error: `Failed to download attachment "${targetAttachment.title}": HTTP ${downloadResponse.status}. Detail: ${errText}`
+      };
+    }
+    csvText = await downloadResponse.text();
+  } catch (err) {
+    console.error(`Error downloading attachment: ${err.message}`);
+    return {
+      success: false,
+      error: `Error downloading attachment "${targetAttachment.title}": ${err.message}`
+    };
+  }
+
+  console.log(`Downloaded CSV: ${csvText.length} characters`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 6 — Parse the SNOW CSV
+  //
+  // We use a hand-rolled parser because SNOW exports can contain quoted fields
+  // that themselves contain commas, newlines, and double-quotes (escaped as "").
+  // JavaScript's built-in String.split(',') is not safe for this.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Parses a CSV string into an array of row arrays.
+   * Handles:
+   *  - Fields quoted with double-quotes
+   *  - Commas inside quoted fields
+   *  - Newlines inside quoted fields
+   *  - Escaped double-quotes ("") inside quoted fields
+   *
+   * @param {string} text - Raw CSV text.
+   * @returns {string[][]} Array of rows, each row being an array of field strings.
+   */
+  function parseCsv(text) {
+    const rows = [];
+    let currentRow = [];
+    let currentField = '';
+    let inQuotes = false;
+    let i = 0;
+
+    // Normalise line endings to \n so we don't have to handle \r\n vs \n separately.
+    const src = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    while (i < src.length) {
+      const ch = src[i];
+
+      if (inQuotes) {
+        if (ch === '"') {
+          // Peek at next character to decide if this is an escaped quote ("") or end-of-field.
+          if (src[i + 1] === '"') {
+            // Escaped double-quote — add a single " to the field and skip both chars.
+            currentField += '"';
+            i += 2;
+          } else {
+            // End of quoted field.
+            inQuotes = false;
+            i++;
+          }
+        } else {
+          // Any other character inside quotes — add it verbatim (including newlines).
+          currentField += ch;
+          i++;
+        }
+      } else {
+        if (ch === '"') {
+          // Start of a quoted field.
+          inQuotes = true;
+          i++;
+        } else if (ch === ',') {
+          // Field separator — push field and start a new one.
+          currentRow.push(currentField);
+          currentField = '';
+          i++;
+        } else if (ch === '\n') {
+          // Row separator — push the last field and start a new row.
+          currentRow.push(currentField);
+          rows.push(currentRow);
+          currentRow = [];
+          currentField = '';
+          i++;
+        } else {
+          currentField += ch;
+          i++;
+        }
+      }
+    }
+
+    // Push any remaining field/row (file may not end with a newline).
+    if (currentField !== '' || currentRow.length > 0) {
+      currentRow.push(currentField);
+      rows.push(currentRow);
+    }
+
+    // Filter out completely empty rows (e.g. trailing newline at end of file).
+    return rows.filter(row => row.some(cell => cell.trim() !== ''));
+  }
+
+  const allRows = parseCsv(csvText);
+
+  if (allRows.length < 2) {
+    return {
+      success: false,
+      error: `The CSV file "${targetAttachment.title}" appears to be empty or has no data rows.`
+    };
+  }
+
+  // Extract header and data rows.
+  const header = allRows[0].map(h => h.trim().toLowerCase());
+  const dataRows = allRows.slice(1);
+
+  console.log(`Parsed CSV: ${dataRows.length} data rows, headers: ${header.join(', ')}`);
+
+  // Helper to get a field value by column name (case-insensitive, trimmed).
+  const col = (row, name) => {
+    const idx = header.indexOf(name.toLowerCase());
+    return idx >= 0 ? (row[idx] || '').trim() : '';
+  };
+
+  // ---------------------------------------------------------------------------
+  // STEP 7 — Validate that this looks like a SNOW export
+  // ---------------------------------------------------------------------------
+
+  const requiredColumns = ['ticket_type', 'number', 'short_description'];
+  const missingColumns = requiredColumns.filter(c => !header.includes(c));
+  if (missingColumns.length > 0) {
+    return {
+      success: false,
+      error: `The CSV file "${targetAttachment.title}" does not appear to be a SNOW export. ` +
+        `Missing required columns: ${missingColumns.join(', ')}. ` +
+        `Expected columns include: ticket_type, number, short_description, description, ` +
+        `state, priority, impact, urgency, category, subcategory, assignment_group, ` +
+        `assigned_to, caller_or_opened_by, opened_at, resolved_or_closed_at, resolved_by, ` +
+        `close_notes, comments_and_work_notes.`
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 8 — Transform each SNOW row into a Jira row
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Maps a SNOW ticket_type value to a Jira Work Type string.
+   * "Request Item" is treated as "Service Request" in Jira.
+   *
+   * @param {string} snowType - Raw ticket_type from SNOW CSV.
+   * @returns {string} Jira Work Type label.
+   */
+  function mapWorkType(snowType) {
+    const t = (snowType || '').trim();
+    if (t === 'Incident') return 'Incident';
+    if (t === 'Change Request') return 'Change Request';
+    if (t === 'Service Request' || t === 'Request Item') return 'Service Request';
+    // Fallback — return as-is so no data is silently lost.
+    return t || 'Incident';
+  }
+
+  /**
+   * Maps a SNOW priority string to a Jira priority label.
+   * SNOW format: "1 - Critical", "2 - High", "3 - Moderate", "4 - Low", "5 - Planning".
+   * Jira format: "Critical", "High", "Medium", "Low".
+   *
+   * @param {string} snowPriority - Raw priority value from SNOW CSV.
+   * @returns {string} Jira priority label.
+   */
+  function mapPriority(snowPriority) {
+    const p = (snowPriority || '').trim();
+    if (p.startsWith('1')) return 'Critical';
+    if (p.startsWith('2')) return 'High';
+    if (p.startsWith('3')) return 'Medium';
+    if (p.startsWith('4')) return 'Low';
+    if (p.startsWith('5')) return 'Low';   // "5 - Planning" → Low
+    // If already a plain Jira label, return as-is.
+    return p || 'Medium';
+  }
+
+  /**
+   * Maps a SNOW ticket_type to a Jira label string (lowercase, underscore-separated).
+   *
+   * @param {string} snowType - Raw ticket_type from SNOW CSV.
+   * @returns {string} Jira label.
+   */
+  function mapLabel(snowType) {
+    const t = (snowType || '').trim();
+    if (t === 'Incident') return 'incident';
+    if (t === 'Change Request') return 'change_request';
+    if (t === 'Service Request' || t === 'Request Item') return 'service_request';
+    return t.toLowerCase().replace(/\s+/g, '_');
+  }
+
+  /**
+   * Builds a plain-text description block from all SNOW metadata fields.
+   * This is the content that will appear in the Jira ticket Description field.
+   * Using plain text (not HTML) so the Jira CSV importer renders it cleanly.
+   *
+   * @param {object} fields - An object with all SNOW field values for this row.
+   * @returns {string} Multi-line plain text description.
+   */
+  function buildDescription(fields) {
+    const lines = [];
+
+    // --- Ticket identity ---
+    lines.push(`ServiceNow Ticket: ${fields.number}`);
+    lines.push(`Ticket Type: ${fields.ticket_type}`);
+
+    // --- Classification ---
+    if (fields.category)    lines.push(`Category: ${fields.category}`);
+    if (fields.subcategory) lines.push(`Subcategory: ${fields.subcategory}`);
+    if (fields.priority)    lines.push(`Priority: ${fields.priority}`);
+    if (fields.impact)      lines.push(`Impact: ${fields.impact}`);
+    if (fields.urgency)     lines.push(`Urgency: ${fields.urgency}`);
+    if (fields.state)       lines.push(`State: ${fields.state}`);
+
+    // --- People ---
+    if (fields.assignment_group)    lines.push(`Assignment Group: ${fields.assignment_group}`);
+    if (fields.assigned_to)         lines.push(`Assigned To: ${fields.assigned_to}`);
+    if (fields.caller_or_opened_by) lines.push(`Reported By: ${fields.caller_or_opened_by}`);
+    if (fields.resolved_by)         lines.push(`Resolved By: ${fields.resolved_by}`);
+
+    // --- Dates ---
+    if (fields.opened_at)              lines.push(`Opened At: ${fields.opened_at}`);
+    if (fields.resolved_or_closed_at)  lines.push(`Resolved/Closed At: ${fields.resolved_or_closed_at}`);
+
+    // --- Problem description ---
+    if (fields.description) {
+      lines.push('');
+      lines.push('Problem Description:');
+      lines.push(fields.description);
+    }
+
+    // --- Resolution ---
+    if (fields.close_notes) {
+      lines.push('');
+      lines.push('Resolution:');
+      lines.push(fields.close_notes);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Splits the SNOW comments_and_work_notes field into individual comment strings.
+   *
+   * SNOW concatenates all comments into a single block, with each comment starting
+   * on a new line that matches the pattern: "YYYY-MM-DD HH:MM:SS - Author (Type)"
+   * e.g.:
+   *   "2024-01-15 09:30:00 - John Smith (Comments)\nHi, I can reproduce this.\n"
+   *   "2024-01-15 10:00:00 - Jane Doe (Work notes)\nAssigned to Network team."
+   *
+   * We use a lookahead regex to split just before each timestamp, preserving the
+   * timestamp as part of the comment it introduces.
+   *
+   * @param {string} commentsField - Raw comments_and_work_notes string from SNOW.
+   * @returns {string[]} Array of individual comment strings (trimmed, non-empty).
+   */
+  function splitComments(commentsField) {
+    if (!commentsField || !commentsField.trim()) return [];
+
+    // Split at positions immediately before a datetime stamp (lookahead so the
+    // stamp itself is included in the following chunk, not lost).
+    const parts = commentsField.split(/(?=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - )/);
+
+    return parts
+      .map(p => p.trim())
+      .filter(p => p.length > 0);
+  }
+
+  // --- First pass: transform all rows and detect the max comment count ---
+
+  const jiraRows = dataRows.map(row => {
+    // Build a convenient named-field object for this row.
+    const fields = {
+      ticket_type:           col(row, 'ticket_type'),
+      number:                col(row, 'number'),
+      short_description:     col(row, 'short_description'),
+      description:           col(row, 'description'),
+      state:                 col(row, 'state'),
+      priority:              col(row, 'priority'),
+      impact:                col(row, 'impact'),
+      urgency:               col(row, 'urgency'),
+      category:              col(row, 'category'),
+      subcategory:           col(row, 'subcategory'),
+      assignment_group:      col(row, 'assignment_group'),
+      assigned_to:           col(row, 'assigned_to'),
+      caller_or_opened_by:   col(row, 'caller_or_opened_by'),
+      opened_at:             col(row, 'opened_at'),
+      resolved_or_closed_at: col(row, 'resolved_or_closed_at'),
+      resolved_by:           col(row, 'resolved_by'),
+      close_notes:           col(row, 'close_notes'),
+      comments_and_work_notes: col(row, 'comments_and_work_notes')
+    };
+
+    const summary     = `${fields.number} - ${fields.short_description}`;
+    const workType    = mapWorkType(fields.ticket_type);
+    const priority    = mapPriority(fields.priority);
+    const labels      = mapLabel(fields.ticket_type);
+    const description = buildDescription(fields);
+    const comments    = splitComments(fields.comments_and_work_notes);
+
+    return { summary, workType, priority, labels, description, comments };
+  });
+
+  // Auto-detect the maximum number of comments across all transformed rows.
+  const maxComments = jiraRows.reduce((max, row) => Math.max(max, row.comments.length), 0);
+  console.log(`Max comments per ticket: ${maxComments}`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 9 — Serialise the transformed data as a Jira-compatible CSV string
+  //
+  // Jira CSV import rules:
+  //  - Multiple comments are represented as REPEATED "Comment" column headers.
+  //  - All fields must be properly quoted (especially Description and Comments
+  //    which can contain commas and newlines).
+  //  - Encoding: UTF-8.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Escapes a single CSV field value.
+   * Wraps the value in double-quotes and escapes any internal double-quotes as "".
+   * This is the safe way to handle values that may contain commas, newlines, or quotes.
+   *
+   * @param {string} value - Raw field value.
+   * @returns {string} Properly quoted CSV field.
+   */
+  function csvField(value) {
+    // Always quote every field for safety — simpler and always correct.
+    const escaped = (value || '').replace(/"/g, '""');
+    return `"${escaped}"`;
+  }
+
+  // Build the header row: fixed columns + repeated "Comment" for each slot.
+  const fixedHeaders = ['Summary', 'Work Type', 'Priority', 'Labels', 'Description'];
+  const commentHeaders = Array(maxComments).fill('Comment');
+  const headerRow = [...fixedHeaders, ...commentHeaders].map(csvField).join(',');
+
+  // Build each data row, padding comments array to maxComments with empty strings.
+  const dataRowStrings = jiraRows.map(row => {
+    const commentCells = Array(maxComments).fill('').map((_, i) => row.comments[i] || '');
+    const cells = [
+      row.summary,
+      row.workType,
+      row.priority,
+      row.labels,
+      row.description,
+      ...commentCells
+    ];
+    return cells.map(csvField).join(',');
+  });
+
+  // Combine header + data rows into the final CSV string (Unix line endings).
+  const outputCsv = [headerRow, ...dataRowStrings].join('\n');
+
+  console.log(`Generated Jira CSV: ${outputCsv.length} characters, ${jiraRows.length} tickets`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 10 — Upload the output CSV as an attachment to the same Confluence page
+  //
+  // Confluence REST API for attachments:
+  //   POST /wiki/rest/api/content/{pageId}/child/attachment
+  //
+  // If an attachment named "jira_import.csv" already exists, we need to use the
+  // update endpoint instead:
+  //   POST /wiki/rest/api/content/{pageId}/child/attachment/{attachmentId}/data
+  //
+  // The request must use multipart/form-data with a "file" part.
+  // We also set X-Atlassian-Token: no-check to bypass XSRF protection for
+  // attachment uploads (required by the Confluence REST API).
+  // ---------------------------------------------------------------------------
+
+  const outputFilename = 'jira_import.csv';
+
+  // Check if jira_import.csv already exists on the page (so we can update vs create).
+  let existingAttachmentId = null;
+  const existingAttachment = attachments.find(a => a.title === outputFilename);
+  if (existingAttachment) {
+    existingAttachmentId = existingAttachment.id;
+    console.log(`Found existing attachment "${outputFilename}" (id: ${existingAttachmentId}) — will update it.`);
+  }
+
+  // Build a multipart/form-data body manually.
+  // Forge does not have a FormData global, so we construct the multipart body
+  // as a string using a fixed boundary delimiter.
+  const boundary = '----ForgeCSVUploadBoundary';
+  const csvBytes = outputCsv; // UTF-8 string — Forge's fetch handles encoding.
+
+  const multipartBody =
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="file"; filename="${outputFilename}"\r\n` +
+    `Content-Type: text/csv\r\n` +
+    `\r\n` +
+    `${csvBytes}\r\n` +
+    `--${boundary}--`;
+
+  // Choose the correct endpoint depending on whether we're creating or updating.
+  const uploadPath = existingAttachmentId
+    ? `/wiki/rest/api/content/${pageId}/child/attachment/${existingAttachmentId}/data`
+    : `/wiki/rest/api/content/${pageId}/child/attachment`;
+
+  let uploadResponse;
+  try {
+    uploadResponse = await api.asUser().requestConfluence(
+      route`${uploadPath}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          // Confluence requires this header to allow attachment uploads via REST API.
+          'X-Atlassian-Token': 'no-check'
+        },
+        body: multipartBody
+      }
+    );
+  } catch (err) {
+    console.error(`Error uploading attachment: ${err.message}`);
+    return {
+      success: false,
+      error: `Transformed ${jiraRows.length} tickets successfully, but failed to upload the result to Confluence: ${err.message}`
+    };
+  }
+
+  if (!uploadResponse.ok) {
+    const errText = await uploadResponse.text();
+    console.error(`Confluence upload error ${uploadResponse.status}: ${errText}`);
+    return {
+      success: false,
+      error: `Transformed ${jiraRows.length} tickets successfully, but Confluence returned HTTP ${uploadResponse.status} ` +
+        `when uploading "${outputFilename}". Detail: ${errText}`
+    };
+  }
+
+  const uploadResult = await uploadResponse.json();
+
+  // Extract the download URL of the newly uploaded attachment.
+  // The API returns a "results" array (create) or a direct result object (update).
+  const uploadedAttachment = Array.isArray(uploadResult.results)
+    ? uploadResult.results[0]
+    : uploadResult;
+
+  const attachmentDownloadPath = uploadedAttachment && uploadedAttachment._links
+    ? uploadedAttachment._links.download
+    : null;
+
+  console.log(`Successfully uploaded "${outputFilename}" to page ${pageId}`);
+
+  // Build the full URL to the attachment for the agent to share with the user.
+  // We derive the base URL from the page URL provided by the user.
+  let attachmentUrl = attachmentDownloadPath || '';
+  if (attachmentUrl && rawPageUrl.startsWith('http')) {
+    // Extract scheme + host from the page URL (e.g. "https://site.atlassian.net").
+    const urlMatch = rawPageUrl.match(/^(https?:\/\/[^/]+)/);
+    if (urlMatch) {
+      attachmentUrl = urlMatch[1] + attachmentDownloadPath;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 11 — Return the result summary for the agent to relay to the user
+  // ---------------------------------------------------------------------------
+
+  return {
+    success: true,
+    ticketsConverted: jiraRows.length,
+    maxComments,
+    outputFilename,
+    attachmentUrl,
+    sourceFile: targetAttachment.title,
+    message: `Successfully converted ${jiraRows.length} SNOW tickets into a Jira-ready CSV ` +
+      `(${maxComments} comment columns). The file "${outputFilename}" has been uploaded to the same Confluence page.`
+  };
+}
+
 export async function createSnowChangeRequest(payload) {
   // --- Step 1: Read and validate Forge environment variables ---
   // These are set at the app level and are not exposed to the frontend.
