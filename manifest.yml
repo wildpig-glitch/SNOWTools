@@ -123,7 +123,7 @@ modules:
         page_url:
           title: Confluence Page URL
           type: string
-          required: true
+          required: false
           description: |
             The full URL of the Confluence page where the SNOW CSV export file is attached,
             or a bare numeric Confluence page ID.
