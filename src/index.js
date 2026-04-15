@@ -271,9 +271,9 @@ function mapImpact(impact) {
  * 9. Returns a summary object for the agent to relay to the user.
  *
  * @param {object} payload - The action input payload provided by the Rovo agent.
- * @param {string} payload.page_url - The full Confluence page URL or a numeric page ID.
- * @param {string} [payload.attachment_filename] - Optional filename hint. If the page has
- *   multiple CSV attachments, this narrows the search. Partial match is fine (e.g. "snow").
+ * @param {string} payload.issue_key - The Jira issue key where the SNOW CSV is attached (e.g. "SNKB-42").
+ * @param {string} [payload.attachment_filename] - Optional filename hint to identify the correct CSV
+ *   if the issue has multiple attachments. Partial match is fine (e.g. "snow").
  * @returns {object} Result object with success flag, ticket count, max comments, and
  *   the URL of the uploaded jira_import.csv attachment.
  */
@@ -283,108 +283,66 @@ export async function convertSnowCsvToJira(payload) {
   // STEP 1 — Validate inputs
   // ---------------------------------------------------------------------------
 
-  const rawPageUrl = (payload.page_url || '').trim();
-  if (!rawPageUrl) {
+  const issueKey = (payload.issue_key || '').trim().toUpperCase();
+  if (!issueKey) {
     return {
       success: false,
-      error: 'page_url is required. Please provide the full Confluence page URL or a numeric page ID.'
+      error: 'issue_key is required. Please provide the Jira issue key where the SNOW CSV is attached (e.g. "SNKB-42").'
     };
   }
 
+  console.log(`convertSnowCsvToJira: using Jira issue ${issueKey}`);
+
   // ---------------------------------------------------------------------------
-  // STEP 2 — Extract the page ID from the URL
+  // STEP 2 — Fetch the list of attachments on the Jira issue
   //
-  // Confluence page URLs come in two formats:
-  //   Modern:  https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Page+Title
-  //   Legacy:  https://site.atlassian.net/wiki/display/KEY/Page+Title?pageId=123456789
-  //
-  // We also accept a bare numeric page ID string (e.g. "123456789").
+  // The Jira REST API v3 issue endpoint returns the full issue, including an
+  // "attachments" array in the "fields" object. We only need the fields.attachment
+  // part, which we request via the "fields" query parameter to minimise payload size.
   // ---------------------------------------------------------------------------
 
-  let pageId;
-
-  // Try to extract numeric page ID from a "/pages/{id}/" segment in the URL.
-  const pagesMatch = rawPageUrl.match(/\/pages\/(\d+)/);
-  if (pagesMatch) {
-    pageId = pagesMatch[1];
-  } else {
-    // Try query-string format: ?pageId=123456789
-    const queryMatch = rawPageUrl.match(/[?&]pageId=(\d+)/);
-    if (queryMatch) {
-      pageId = queryMatch[1];
-    } else if (/^\d+$/.test(rawPageUrl)) {
-      // The caller passed a bare numeric ID.
-      pageId = rawPageUrl;
-    }
-  }
-
-  if (!pageId) {
-    return {
-      success: false,
-      error: `Could not extract a page ID from: "${rawPageUrl}". ` +
-        `Please provide a full Confluence page URL (e.g. https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Title) ` +
-        `or a numeric page ID.`
-    };
-  }
-
-  console.log(`convertSnowCsvToJira: using page ID ${pageId}`);
-
-  // ---------------------------------------------------------------------------
-  // STEP 3 — Fetch the list of attachments on the Confluence page
-  // ---------------------------------------------------------------------------
-
-  let attachmentsResponse;
+  let issueData;
   try {
-    attachmentsResponse = await api.asApp().requestConfluence(
-      route`/wiki/rest/api/content/${pageId}/child/attachment?expand=metadata&limit=50`
+    const issueResponse = await api.asUser().requestJira(
+      route`/rest/api/3/issue/${issueKey}?fields=attachment,summary`
     );
-    console.log(`Attachments API response status: ${attachmentsResponse.status}`);
+    console.log(`Issue API response status: ${issueResponse.status}`);
+
+    if (!issueResponse.ok) {
+      const errText = await issueResponse.text();
+      console.error(`Jira issue API error ${issueResponse.status}: ${errText}`);
+      if (issueResponse.status === 404) {
+        return {
+          success: false,
+          error: `Jira issue "${issueKey}" was not found. Please check the issue key and try again.`
+        };
+      }
+      return {
+        success: false,
+        error: `Jira API returned HTTP ${issueResponse.status} when fetching issue "${issueKey}". Detail: ${errText}`
+      };
+    }
+    issueData = await issueResponse.json();
   } catch (err) {
-    // Log the full error object to help diagnose SDK-level failures.
-    console.error(`Error fetching attachments (exception): ${err.message}`, JSON.stringify(err));
+    console.error(`Error fetching Jira issue: ${err.message}`, JSON.stringify(err));
     return {
       success: false,
-      error: `Could not fetch attachments for page ${pageId}: ${err.message}`
+      error: `Could not fetch Jira issue "${issueKey}": ${err.message}`
     };
   }
 
-  if (!attachmentsResponse.ok) {
-    const errText = await attachmentsResponse.text();
-    console.error(`Confluence attachments API error ${attachmentsResponse.status}: ${errText}`);
-    if (attachmentsResponse.status === 401) {
-      return {
-        success: false,
-        error: `Confluence returned 401 Unauthorized for page ${pageId}. ` +
-          `This usually means the app's Confluence scopes have not been consented to on this site. ` +
-          `HTTP status: 401. Detail: ${errText}`
-      };
-    }
-    if (attachmentsResponse.status === 404) {
-      return {
-        success: false,
-        error: `Confluence page with ID "${pageId}" was not found. ` +
-          `Please check the URL and make sure the page exists and you have access to it.`
-      };
-    }
-    return {
-      success: false,
-      error: `Confluence API returned HTTP ${attachmentsResponse.status} when fetching attachments. Detail: ${errText}`
-    };
-  }
-
-  const attachmentsData = await attachmentsResponse.json();
-  const attachments = attachmentsData.results || [];
+  const attachments = (issueData.fields && issueData.fields.attachment) || [];
 
   if (attachments.length === 0) {
     return {
       success: false,
-      error: `No attachments found on Confluence page ${pageId}. ` +
-        `Please upload the SNOW CSV export file to that page first.`
+      error: `No attachments found on Jira issue "${issueKey}". ` +
+        `Please attach the SNOW CSV export file to that issue first.`
     };
   }
 
   // ---------------------------------------------------------------------------
-  // STEP 4 — Find the target CSV attachment
+  // STEP 3 — Find the target CSV attachment
   //
   // Selection priority:
   //  1. If attachment_filename is provided, find an attachment whose filename
@@ -397,13 +355,13 @@ export async function convertSnowCsvToJira(payload) {
   let targetAttachment;
   if (filenameHint) {
     targetAttachment = attachments.find(a =>
-      (a.title || '').toLowerCase().includes(filenameHint)
+      (a.filename || '').toLowerCase().includes(filenameHint)
     );
     if (!targetAttachment) {
-      const allNames = attachments.map(a => a.title).join(', ');
+      const allNames = attachments.map(a => a.filename).join(', ');
       return {
         success: false,
-        error: `No attachment matching "${filenameHint}" found on page ${pageId}. ` +
+        error: `No attachment matching "${filenameHint}" found on issue "${issueKey}". ` +
           `Available attachments: ${allNames}. ` +
           `Please check the filename hint or leave it blank to pick the first CSV found.`
       };
@@ -411,59 +369,40 @@ export async function convertSnowCsvToJira(payload) {
   } else {
     // No hint — pick the first .csv file.
     targetAttachment = attachments.find(a =>
-      (a.title || '').toLowerCase().endsWith('.csv')
+      (a.filename || '').toLowerCase().endsWith('.csv')
     );
     if (!targetAttachment) {
-      const allNames = attachments.map(a => a.title).join(', ');
+      const allNames = attachments.map(a => a.filename).join(', ');
       return {
         success: false,
-        error: `No CSV attachment found on page ${pageId}. ` +
+        error: `No CSV attachment found on issue "${issueKey}". ` +
           `Available attachments: ${allNames}. ` +
-          `Please upload your SNOW export as a .csv file.`
+          `Please attach your SNOW export as a .csv file to that issue.`
       };
     }
   }
 
-  console.log(`Found attachment: "${targetAttachment.title}" (id: ${targetAttachment.id})`);
-
-  // Build the download URL from the attachment's _links.download path.
-  // The download link is a relative path like /wiki/download/attachments/...
-  const downloadPath = targetAttachment._links && targetAttachment._links.download;
-  if (!downloadPath) {
-    return {
-      success: false,
-      error: `Could not determine the download URL for attachment "${targetAttachment.title}".`
-    };
-  }
+  console.log(`Found attachment: "${targetAttachment.filename}" (id: ${targetAttachment.id})`);
 
   // ---------------------------------------------------------------------------
-  // STEP 5 — Download the CSV attachment content
+  // STEP 4 — Download the CSV attachment content
   //
-  // The attachment download path from _links.download looks like:
-  //   /wiki/download/attachments/{pageId}/{filename}?version=1&modificationDate=...
-  //
-  // We must use route`` with the path as a static string. Since the download
-  // path is fully dynamic, we split it into the base path and query string,
-  // then construct the route with the path baked in.
-  //
-  // Simpler approach: use the attachment ID to build a known-safe API path
-  // to retrieve the attachment content via the REST API instead of the
-  // download URL, avoiding the need to pass a dynamic path to route``.
-  // The Confluence REST API supports fetching attachment data via:
-  //   GET /wiki/rest/api/content/{attachmentId}/data
+  // The Jira REST API provides a direct download URL for each attachment via
+  // the "content" field (e.g. https://site.atlassian.net/rest/api/3/attachment/content/{id}).
+  // We use the attachment ID to build a known-safe route`` path.
   // ---------------------------------------------------------------------------
 
   let csvText;
   try {
     const attachmentId = targetAttachment.id;
-    const downloadResponse = await api.asApp().requestConfluence(
-      route`/wiki/rest/api/content/${attachmentId}/data`
+    const downloadResponse = await api.asUser().requestJira(
+      route`/rest/api/3/attachment/content/${attachmentId}`
     );
     if (!downloadResponse.ok) {
       const errText = await downloadResponse.text();
       return {
         success: false,
-        error: `Failed to download attachment "${targetAttachment.title}": HTTP ${downloadResponse.status}. Detail: ${errText}`
+        error: `Failed to download attachment "${targetAttachment.filename}": HTTP ${downloadResponse.status}. Detail: ${errText}`
       };
     }
     csvText = await downloadResponse.text();
@@ -471,7 +410,7 @@ export async function convertSnowCsvToJira(payload) {
     console.error(`Error downloading attachment: ${err.message}`);
     return {
       success: false,
-      error: `Error downloading attachment "${targetAttachment.title}": ${err.message}`
+      error: `Error downloading attachment "${targetAttachment.filename}": ${err.message}`
     };
   }
 
@@ -817,58 +756,44 @@ export async function convertSnowCsvToJira(payload) {
   console.log(`Generated Jira CSV: ${outputCsv.length} characters, ${jiraRows.length} tickets`);
 
   // ---------------------------------------------------------------------------
-  // STEP 10 — Upload the output CSV as an attachment to the same Confluence page
+  // STEP 10 — Upload the output CSV as an attachment to the same Jira issue
   //
-  // Confluence REST API for attachments:
-  //   POST /wiki/rest/api/content/{pageId}/child/attachment
+  // Jira REST API for attachments:
+  //   POST /rest/api/2/issue/{issueKey}/attachments
   //
-  // If an attachment named "jira_import.csv" already exists, we need to use the
-  // update endpoint instead:
-  //   POST /wiki/rest/api/content/{pageId}/child/attachment/{attachmentId}/data
+  // Note: Jira does not have a separate "update" endpoint for attachments —
+  // uploading a file with the same name creates a new version alongside the old one.
+  // This is fine for our use case.
   //
   // The request must use multipart/form-data with a "file" part.
-  // We also set X-Atlassian-Token: no-check to bypass XSRF protection for
-  // attachment uploads (required by the Confluence REST API).
+  // Jira also requires the X-Atlassian-Token: no-check header to bypass XSRF
+  // protection for attachment uploads.
   // ---------------------------------------------------------------------------
 
   const outputFilename = 'jira_import.csv';
 
-  // Check if jira_import.csv already exists on the page (so we can update vs create).
-  let existingAttachmentId = null;
-  const existingAttachment = attachments.find(a => a.title === outputFilename);
-  if (existingAttachment) {
-    existingAttachmentId = existingAttachment.id;
-    console.log(`Found existing attachment "${outputFilename}" (id: ${existingAttachmentId}) — will update it.`);
-  }
-
   // Build a multipart/form-data body manually.
-  // Forge does not have a FormData global, so we construct the multipart body
+  // Forge does not expose a FormData global, so we construct the multipart body
   // as a string using a fixed boundary delimiter.
   const boundary = '----ForgeCSVUploadBoundary';
-  const csvBytes = outputCsv; // UTF-8 string — Forge's fetch handles encoding.
 
   const multipartBody =
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="file"; filename="${outputFilename}"\r\n` +
     `Content-Type: text/csv\r\n` +
     `\r\n` +
-    `${csvBytes}\r\n` +
+    `${outputCsv}\r\n` +
     `--${boundary}--`;
 
-  // Choose the correct endpoint depending on whether we're creating or updating.
-  // We use route`` with properly interpolated values (not a pre-built string)
-  // so that Forge can correctly validate and sign the request path.
   let uploadResponse;
   try {
-    uploadResponse = await api.asApp().requestConfluence(
-      existingAttachmentId
-        ? route`/wiki/rest/api/content/${pageId}/child/attachment/${existingAttachmentId}/data`
-        : route`/wiki/rest/api/content/${pageId}/child/attachment`,
+    uploadResponse = await api.asUser().requestJira(
+      route`/rest/api/2/issue/${issueKey}/attachments`,
       {
         method: 'POST',
         headers: {
           'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          // Confluence requires this header to allow attachment uploads via REST API.
+          // Jira requires this header to allow attachment uploads via REST API.
           'X-Atlassian-Token': 'no-check'
         },
         body: multipartBody
@@ -878,44 +803,32 @@ export async function convertSnowCsvToJira(payload) {
     console.error(`Error uploading attachment: ${err.message}`);
     return {
       success: false,
-      error: `Transformed ${jiraRows.length} tickets successfully, but failed to upload the result to Confluence: ${err.message}`
+      error: `Converted ${jiraRows.length} tickets successfully, but failed to upload the result to Jira issue "${issueKey}": ${err.message}`
     };
   }
 
   if (!uploadResponse.ok) {
     const errText = await uploadResponse.text();
-    console.error(`Confluence upload error ${uploadResponse.status}: ${errText}`);
+    console.error(`Jira upload error ${uploadResponse.status}: ${errText}`);
     return {
       success: false,
-      error: `Transformed ${jiraRows.length} tickets successfully, but Confluence returned HTTP ${uploadResponse.status} ` +
-        `when uploading "${outputFilename}". Detail: ${errText}`
+      error: `Converted ${jiraRows.length} tickets successfully, but Jira returned HTTP ${uploadResponse.status} ` +
+        `when uploading "${outputFilename}" to issue "${issueKey}". Detail: ${errText}`
     };
   }
 
   const uploadResult = await uploadResponse.json();
 
-  // Extract the download URL of the newly uploaded attachment.
-  // The API returns a "results" array (create) or a direct result object (update).
-  const uploadedAttachment = Array.isArray(uploadResult.results)
-    ? uploadResult.results[0]
-    : uploadResult;
+  // The Jira attachment upload API returns an array of uploaded attachment objects.
+  // Each object has an id, filename, and a self URL.
+  const uploadedAttachment = Array.isArray(uploadResult) ? uploadResult[0] : uploadResult;
+  const attachmentId = uploadedAttachment && uploadedAttachment.id;
 
-  const attachmentDownloadPath = uploadedAttachment && uploadedAttachment._links
-    ? uploadedAttachment._links.download
-    : null;
+  // Build a direct link to the Jira issue for the agent to share with the user.
+  // The attachment itself can be downloaded from the issue's attachment panel.
+  const issueUrl = `https://santander-rovo-workshop.atlassian.net/browse/${issueKey}`;
 
-  console.log(`Successfully uploaded "${outputFilename}" to page ${pageId}`);
-
-  // Build the full URL to the attachment for the agent to share with the user.
-  // We derive the base URL from the page URL provided by the user.
-  let attachmentUrl = attachmentDownloadPath || '';
-  if (attachmentUrl && rawPageUrl.startsWith('http')) {
-    // Extract scheme + host from the page URL (e.g. "https://site.atlassian.net").
-    const urlMatch = rawPageUrl.match(/^(https?:\/\/[^/]+)/);
-    if (urlMatch) {
-      attachmentUrl = urlMatch[1] + attachmentDownloadPath;
-    }
-  }
+  console.log(`Successfully uploaded "${outputFilename}" to Jira issue ${issueKey} (attachment id: ${attachmentId})`);
 
   // ---------------------------------------------------------------------------
   // STEP 11 — Return the result summary for the agent to relay to the user
@@ -926,10 +839,10 @@ export async function convertSnowCsvToJira(payload) {
     ticketsConverted: jiraRows.length,
     maxComments,
     outputFilename,
-    attachmentUrl,
-    sourceFile: targetAttachment.title,
+    issueUrl,
+    sourceFile: targetAttachment.filename,
     message: `Successfully converted ${jiraRows.length} SNOW tickets into a Jira-ready CSV ` +
-      `(${maxComments} comment columns). The file "${outputFilename}" has been uploaded to the same Confluence page.`
+      `(${maxComments} comment columns). The file "${outputFilename}" has been attached to Jira issue ${issueKey}.`
   };
 }
 

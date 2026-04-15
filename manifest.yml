@@ -118,25 +118,23 @@ modules:
       name: Convert SNOW CSV to Jira Import
       function: convertSnowCsvToJira
       actionVerb: GET
-      description: Converts a SNOW CSV export (attached to a Confluence page) into a Jira-ready import CSV and uploads the result back to the same page.
+      description: Converts a SNOW CSV export (attached to a Jira issue) into a Jira-ready import CSV and uploads the result back to the same issue.
       inputs:
-        page_url:
-          title: Confluence Page URL
+        issue_key:
+          title: Jira Issue Key
           type: string
           required: false
           description: |
-            The full URL of the Confluence page where the SNOW CSV export file is attached,
-            or a bare numeric Confluence page ID.
-            Example: "https://site.atlassian.net/wiki/spaces/KEY/pages/123456789/Page+Title"
-            Ask the user to provide this value.
+            The Jira issue key where the SNOW CSV export file is attached as an attachment.
+            Example: "SNKB-42". Ask the user to provide this value.
         attachment_filename:
           title: Attachment Filename Hint
           type: string
           required: false
           description: |
-            Optional partial filename to identify the correct CSV attachment if the page
+            Optional partial filename to identify the correct CSV attachment if the issue
             has multiple attachments. For example "snow" or "export". Leave blank to
-            automatically pick the first .csv file found on the page.
+            automatically pick the first .csv file found on the issue.
   function:
     - key: getJiraRelease
       handler: index.getJiraRelease
@@ -160,6 +158,5 @@ permissions:
         - address: "*.service-now.com"
   scopes:
     - read:jira-work
+    - write:jira-work
     - read:chat:rovo
-    - read:confluence-content.all
-    - write:confluence-content
