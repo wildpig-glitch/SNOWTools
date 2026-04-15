@@ -1,77 +1,87 @@
-# SNOW CSV to Jira Import — Conversation Starter Prompt
+# Scenario: Convert SNOW CSV Export to Jira Import
 
-Use this prompt to kick off the SNOW CSV conversion flow with the SNOWTools Rovo agent.
-Copy and paste the text below (under "Prompt to paste") into the Rovo chat window.
+## Purpose
 
----
-
-## Prompt to paste
-
-```
-I have a ServiceNow ticket export that I need to convert into a Jira-ready CSV import file.
-
-The SNOW CSV export is attached to this Confluence page:
-[paste your Confluence page URL here]
-
-Please convert it and upload the result back to the same page.
-```
+This scenario handles converting a ServiceNow (SNOW) ticket export CSV file — attached to a
+Confluence page — into a Jira-ready CSV import file. The converted file is uploaded back to
+the same Confluence page as `jira_import.csv`.
 
 ---
 
-## What will happen
+## When to trigger this scenario
 
-1. The agent will call the `convert-snow-csv-to-jira` action with the page URL you provided.
-2. The action will:
-   - Find the first `.csv` file attached to that Confluence page
-   - Parse and transform all SNOW tickets into the Jira import format
-   - Auto-detect the number of comment columns needed
-   - Upload the result as `jira_import.csv` back to the same page
-3. The agent will reply with:
-   - ✅ Number of tickets converted
-   - Number of comment columns generated
-   - 📎 A direct download link for `jira_import.csv`
+Activate this scenario when the user says something like:
+
+- "Convert my SNOW export to Jira"
+- "Transform the ServiceNow CSV for Jira import"
+- "I have a SNOW tickets export, can you convert it for Jira?"
+- "Turn my ServiceNow export into a Jira CSV"
+- "I need to import SNOW tickets into Jira"
 
 ---
 
-## Optional: specify the filename
+## Conversation flow
 
-If your Confluence page has multiple CSV attachments and you need a specific one, add this to your prompt:
+### STEP 1 — Ask for the Confluence page URL
 
-```
-The filename of the SNOW export is: [e.g. snow_tickets_export.csv]
-```
+Your first message must always be:
 
----
+> "Sure! Please share the URL of the Confluence page where your SNOW CSV export is attached."
 
-## What the output CSV contains
-
-| Jira Column   | Source                                                                 |
-|---------------|------------------------------------------------------------------------|
-| Summary       | `{SNOW number} - {short_description}`                                  |
-| Work Type     | Incident / Change Request / Service Request (Request Item → Service Request) |
-| Priority      | Mapped: 1-Critical, 2-High, 3-Moderate→Medium, 4/5-Low→Low            |
-| Labels        | Lowercase ticket type: `incident`, `change_request`, `service_request` |
-| Description   | Plain-text block: all SNOW metadata + problem description + resolution |
-| Comment (×N)  | Each SNOW work note / comment as a separate Jira Comment column        |
+Wait for the user to provide the URL. Do NOT guess, fabricate, or assume any page URL.
 
 ---
 
-## How to import into Jira
+### STEP 2 — Check if a filename hint is needed
 
-Once you have downloaded `jira_import.csv`:
+If the user mentions that the page has multiple CSV files and wants a specific one, ask:
 
-1. Go to your Jira project
-2. Navigate to **Project settings → Import issues → CSV**
-   *(use the **old import experience** if prompted — the new one does not support multi-comment CSV)*
-3. Upload `jira_import.csv`
-4. On the field mapping screen, map:
-   - `Summary` → Summary
-   - `Work Type` → Issue Type
-   - `Priority` → Priority
-   - `Labels` → Labels
-   - `Description` → Description
-   - `Comment` → Comment
-5. Complete the import
+> "What is the filename of the SNOW export on that page? (e.g. `snow_tickets_export.csv`)"
 
-> **Tip:** Run a test import with a small sample (10 rows) first to validate field mappings
-> before importing all tickets.
+Otherwise, skip this — the action will automatically pick the first `.csv` file found on the page.
+
+---
+
+### STEP 3 — Call `convert-snow-csv-to-jira`
+
+Once you have the page URL, immediately call the action with:
+
+- `page_url` → exactly as provided by the user (full Confluence URL or numeric page ID)
+- `attachment_filename` → only if the user specified one; otherwise omit this parameter entirely
+
+**Do NOT call this action before you have the page URL from the user.**
+
+---
+
+### STEP 4 — Report the result
+
+**On success**, tell the user:
+
+> "✅ Done! I converted **{ticketsConverted} SNOW tickets** into a Jira-ready CSV with **{maxComments} comment columns**.
+>
+> The file **{outputFilename}** has been uploaded to the same Confluence page.
+> 📎 [Download jira_import.csv]({attachmentUrl})
+>
+> You can now import this file into Jira:
+> 1. Go to your Jira project → **Project settings → Import issues → CSV**
+>    *(use the old import experience if prompted)*
+> 2. Upload `jira_import.csv` and map the fields:
+>    - Summary → Summary
+>    - Work Type → Issue Type
+>    - Priority → Priority
+>    - Labels → Labels
+>    - Description → Description
+>    - Comment → Comment"
+
+**On any error**, relay the exact error message returned by the action so the user knows what
+to fix (e.g. wrong page URL, no CSV attached, unrecognised file format, missing columns).
+Do NOT paraphrase or hide error details.
+
+---
+
+## Rules
+
+- **Never call the action** before the user has provided the Confluence page URL
+- **Never fabricate** a page URL, attachment name, or ticket count
+- **Always relay errors in full** — they are written to be human-readable and actionable
+- If the action succeeds but `attachmentUrl` is empty, still tell the user the conversion succeeded and ask them to check the Confluence page directly for the `jira_import.csv` attachment
