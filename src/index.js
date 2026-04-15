@@ -335,11 +335,13 @@ export async function convertSnowCsvToJira(payload) {
 
   let attachmentsResponse;
   try {
-    attachmentsResponse = await api.asUser().requestConfluence(
+    attachmentsResponse = await api.asApp().requestConfluence(
       route`/wiki/rest/api/content/${pageId}/child/attachment?expand=metadata&limit=50`
     );
+    console.log(`Attachments API response status: ${attachmentsResponse.status}`);
   } catch (err) {
-    console.error(`Error fetching attachments: ${err.message}`);
+    // Log the full error object to help diagnose SDK-level failures.
+    console.error(`Error fetching attachments (exception): ${err.message}`, JSON.stringify(err));
     return {
       success: false,
       error: `Could not fetch attachments for page ${pageId}: ${err.message}`
@@ -349,6 +351,14 @@ export async function convertSnowCsvToJira(payload) {
   if (!attachmentsResponse.ok) {
     const errText = await attachmentsResponse.text();
     console.error(`Confluence attachments API error ${attachmentsResponse.status}: ${errText}`);
+    if (attachmentsResponse.status === 401) {
+      return {
+        success: false,
+        error: `Confluence returned 401 Unauthorized for page ${pageId}. ` +
+          `This usually means the app's Confluence scopes have not been consented to on this site. ` +
+          `HTTP status: 401. Detail: ${errText}`
+      };
+    }
     if (attachmentsResponse.status === 404) {
       return {
         success: false,
@@ -446,7 +456,7 @@ export async function convertSnowCsvToJira(payload) {
   let csvText;
   try {
     const attachmentId = targetAttachment.id;
-    const downloadResponse = await api.asUser().requestConfluence(
+    const downloadResponse = await api.asApp().requestConfluence(
       route`/wiki/rest/api/content/${attachmentId}/data`
     );
     if (!downloadResponse.ok) {
@@ -850,7 +860,7 @@ export async function convertSnowCsvToJira(payload) {
   // so that Forge can correctly validate and sign the request path.
   let uploadResponse;
   try {
-    uploadResponse = await api.asUser().requestConfluence(
+    uploadResponse = await api.asApp().requestConfluence(
       existingAttachmentId
         ? route`/wiki/rest/api/content/${pageId}/child/attachment/${existingAttachmentId}/data`
         : route`/wiki/rest/api/content/${pageId}/child/attachment`,
