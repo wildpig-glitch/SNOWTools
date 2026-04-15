@@ -428,14 +428,26 @@ export async function convertSnowCsvToJira(payload) {
 
   // ---------------------------------------------------------------------------
   // STEP 5 — Download the CSV attachment content
+  //
+  // The attachment download path from _links.download looks like:
+  //   /wiki/download/attachments/{pageId}/{filename}?version=1&modificationDate=...
+  //
+  // We must use route`` with the path as a static string. Since the download
+  // path is fully dynamic, we split it into the base path and query string,
+  // then construct the route with the path baked in.
+  //
+  // Simpler approach: use the attachment ID to build a known-safe API path
+  // to retrieve the attachment content via the REST API instead of the
+  // download URL, avoiding the need to pass a dynamic path to route``.
+  // The Confluence REST API supports fetching attachment data via:
+  //   GET /wiki/rest/api/content/{attachmentId}/data
   // ---------------------------------------------------------------------------
 
   let csvText;
   try {
+    const attachmentId = targetAttachment.id;
     const downloadResponse = await api.asUser().requestConfluence(
-      // requestConfluence accepts a full path; route`` handles encoding.
-      // The download path already includes /wiki/ prefix so we pass it directly.
-      route`${downloadPath}`
+      route`/wiki/rest/api/content/${attachmentId}/data`
     );
     if (!downloadResponse.ok) {
       const errText = await downloadResponse.text();
@@ -834,14 +846,14 @@ export async function convertSnowCsvToJira(payload) {
     `--${boundary}--`;
 
   // Choose the correct endpoint depending on whether we're creating or updating.
-  const uploadPath = existingAttachmentId
-    ? `/wiki/rest/api/content/${pageId}/child/attachment/${existingAttachmentId}/data`
-    : `/wiki/rest/api/content/${pageId}/child/attachment`;
-
+  // We use route`` with properly interpolated values (not a pre-built string)
+  // so that Forge can correctly validate and sign the request path.
   let uploadResponse;
   try {
     uploadResponse = await api.asUser().requestConfluence(
-      route`${uploadPath}`,
+      existingAttachmentId
+        ? route`/wiki/rest/api/content/${pageId}/child/attachment/${existingAttachmentId}/data`
+        : route`/wiki/rest/api/content/${pageId}/child/attachment`,
       {
         method: 'POST',
         headers: {
