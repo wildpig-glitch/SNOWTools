@@ -118,11 +118,7 @@ modules:
       name: Convert SNOW CSV to Jira Import
       function: convertSnowCsvToJira
       actionVerb: GET
-      description: |
-        Converts a ServiceNow CSV export file (attached to a Confluence page) into a
-        Jira-ready CSV import file, and uploads the result back as a new attachment on
-        the same Confluence page. Call this when the user wants to transform a SNOW export
-        into a format that can be imported into Jira.
+      description: Converts a SNOW CSV export (attached to a Confluence page) into a Jira-ready import CSV and uploads the result back to the same page.
       inputs:
         page_url:
           title: Confluence Page URL
