@@ -3,8 +3,8 @@
 ## Purpose
 
 This scenario handles converting a ServiceNow (SNOW) ticket export CSV file — attached to a
-Confluence page — into a Jira-ready CSV import file. The converted file is uploaded back to
-the same Confluence page as `jira_import.csv`.
+Jira issue as an attachment — into a Jira-ready CSV import file. The converted file is uploaded
+back to the same Jira issue as `jira_import.csv`.
 
 ---
 
