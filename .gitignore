@@ -3,3 +3,4 @@ node_modules/
 *.local
 automation-rule-*.json
 snowtools-automation-rule.json
+*.csv
