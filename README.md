@@ -36,7 +36,7 @@ SNOWTools can transform a raw ServiceNow ticket export (CSV) into a Jira-ready i
    - **Priority**: mapped from SNOW format (`3 - Moderate` → `Medium`)
    - **Labels**: `incident`, `change_request`, `service_request`
    - **Description**: plain-text block with all SNOW metadata + problem description + resolution
-   - **Comments**: split from `comments_and_work_notes` via datetime regex; max count auto-detected
+   - **Comments**: In the SNOW CSV, all comments and work notes are concatenated into a single `comments_and_work_notes` field. The converter splits them into individual comments by detecting each comment's timestamp header (pattern: `YYYY-MM-DD HH:MM:SS - Author (Type)`). The Jira CSV import format requires one repeated `Comment` column per comment, so the converter scans all tickets first to find the maximum comment count, then generates exactly that many `Comment` columns — tickets with fewer comments get empty cells in the extra columns.
 5. Uploads `jira_import.csv` back to the same Jira issue as an attachment
 
 ## Architecture
