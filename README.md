@@ -1,8 +1,13 @@
 # SNOWTools
 
-A [Rovo Agent](https://developer.atlassian.com/platform/forge/rovo-agents/) built on the [Atlassian Forge](https://developer.atlassian.com/platform/forge/) platform that creates **ServiceNow (SNOW) Change Requests** from **Jira releases**, enriched with context from **Confluence architecture documentation**.
+A [Rovo Agent](https://developer.atlassian.com/platform/forge/rovo-agents/) built on the [Atlassian Forge](https://developer.atlassian.com/platform/forge/) platform with two capabilities:
 
-## What it does
+1. **Create ServiceNow (SNOW) Change Requests** from Jira releases, enriched with Confluence architecture documentation
+2. **Convert SNOW CSV exports** into Jira-ready import files
+
+## Capabilities
+
+### 1. Create SNOW Change Requests from Jira Releases
 
 SNOWTools guides a user through creating a ServiceNow Change Request by:
 
@@ -17,6 +22,22 @@ SNOWTools guides a user through creating a ServiceNow Change Request by:
    - Test Plan
 4. **Asking the user to confirm** the recommendations and provide the SNOW assignment group
 5. **Creating the Change Request** in ServiceNow via the Table REST API
+
+### 2. Convert SNOW CSV Export to Jira Import
+
+SNOWTools can transform a raw ServiceNow ticket export (CSV) into a Jira-ready import file:
+
+1. User attaches the SNOW CSV export to any Jira issue
+2. User tells the agent the Jira issue key (e.g. `SNKB-42`)
+3. Agent fetches and downloads the CSV attachment via the Jira REST API
+4. Transforms each row:
+   - **Summary**: `{SNOW_number} - {short_description}`
+   - **Work Type**: Incident / Change Request / Service Request (`Request Item` → `Service Request`)
+   - **Priority**: mapped from SNOW format (`3 - Moderate` → `Medium`)
+   - **Labels**: `incident`, `change_request`, `service_request`
+   - **Description**: plain-text block with all SNOW metadata + problem description + resolution
+   - **Comments**: split from `comments_and_work_notes` via datetime regex; max count auto-detected
+5. Uploads `jira_import.csv` back to the same Jira issue as an attachment
 
 ## Architecture
 
@@ -33,8 +54,13 @@ SNOWTools Rovo Agent
   ├─► Native Confluence access (read:confluence-content.all)
   │     └─ Searches for architecture reference page in matching space
   │
-  └─► Action: create-snow-change-request
-        └─ SNOW Table API: POST /api/now/table/change_request
+  ├─► Action: create-snow-change-request
+  │     └─ SNOW Table API: POST /api/now/table/change_request
+  │
+  └─► Action: convert-snow-csv-to-jira
+        └─ Jira REST API: GET /rest/api/3/issue/{key}?fields=attachment
+        └─ Jira REST API: GET /rest/api/3/attachment/content/{id}
+        └─ Jira REST API: POST /rest/api/2/issue/{key}/attachments
 ```
 
 ## Forge Actions
@@ -43,6 +69,7 @@ SNOWTools Rovo Agent
 |--------|----------|---------|
 | `get-jira-release` | `getJiraRelease` | Fetches Jira version details and linked issues |
 | `create-snow-change-request` | `createSnowChangeRequest` | Creates the CR in ServiceNow |
+| `convert-snow-csv-to-jira` | `convertSnowCsvToJira` | Converts a SNOW CSV export into a Jira-ready import CSV |
 
 ## Setup
 
@@ -73,8 +100,13 @@ forge variables set --environment development SNOW_PASSWORD your-password
 ```bash
 forge deploy --non-interactive -e development
 forge install --non-interactive --site yoursite.atlassian.net --product jira --environment development
-forge install --non-interactive --site yoursite.atlassian.net --product confluence --environment development
 ```
+
+## Rovo Studio Scenario
+
+The `prompts/snow-csv-to-jira-prompt.md` file contains a ready-to-use scenario prompt for Rovo Studio.
+Create a new scenario in the SNOWTools agent in Studio and paste the contents of that file as the scenario instructions.
+This will enable the agent to guide users through the SNOW CSV → Jira import conversion flow.
 
 ## Confluence Architecture Reference
 
@@ -110,7 +142,8 @@ See the [Nova Data – Application Architecture Overview](https://sk-demo-site.a
 - ServiceNow developer instances hibernate after inactivity — wake them up at [developer.servicenow.com](https://developer.servicenow.com) before use
 - The `risk` field supports 3 values on this SNOW instance (Low/Moderate/High) — "Very High" is mapped to "High"
 - Assignment group is free-text — if the group name doesn't exist in SNOW, the CR may be created without it
+- `api.asUser().requestConfluence()` is not available in Rovo action function context (no user session) — Confluence attachment reads must use `asApp()` or be avoided in favour of Jira attachments
 
 ## Project Context
 
-See [CONTEXT.md](./CONTEXT.md) for detailed technical decisions, lessons learned, and next steps.
+See [santander-hackathon-progress.md](./santander-hackathon-progress.md) for detailed technical decisions, lessons learned, and next steps.
